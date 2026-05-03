@@ -75,6 +75,23 @@ class AsyncTCP_detail;
 
 class AsyncClient {
 public:
+  /**
+   * @brief Lifecycle state of the AsyncClient.
+   *
+   * Independent of lwIP's per-pcb TCP state — this tracks how the AsyncClient
+   * itself sees its lifecycle, and remains valid after `_pcb` has been freed
+   * by lwIP (e.g. after a TCP error). Use getState() / stateToString() to
+   * query it from any thread.
+   */
+  enum class State : uint8_t {
+    INIT,        // newly constructed, not yet connecting
+    CONNECTING,  // connect() issued, awaiting connect callback or DNS
+    CONNECTED,   // ESTABLISHED
+    CLOSING,     // close() called or FIN received, teardown in progress
+    CLOSED,      // graceful close completed
+    ERRORED,     // tcp_error fired; pcb has been freed by lwIP
+  };
+
   AsyncClient(tcp_pcb *pcb = 0);
   ~AsyncClient();
 
@@ -263,6 +280,13 @@ public:
   static const char *errorToString(int8_t error);
   const char *stateToString() const;
 
+  // AsyncClient-level lifecycle state (independent of lwIP pcb state).
+  // Safe to call after a TCP error has freed the underlying pcb.
+  State getState() const {
+    return _state;
+  }
+  static const char *stateToString(State s);
+
   int8_t _recv(tcp_pcb *pcb, pbuf *pb, int8_t err);
   tcp_pcb *pcb() {
     return _pcb;
@@ -299,6 +323,7 @@ protected:
   uint32_t _rx_last_ack;
   uint32_t _ack_timeout;
   uint16_t _connect_port;
+  State _state;
 
   int8_t _close();
   int8_t _connected(tcp_pcb *pcb, int8_t err);
@@ -306,7 +331,6 @@ protected:
   int8_t _poll(tcp_pcb *pcb);
   int8_t _sent(tcp_pcb *pcb, uint16_t len);
   int8_t _fin(tcp_pcb *pcb, int8_t err);
-  int8_t _lwip_fin(tcp_pcb *pcb, int8_t err);
   void _dns_found(ip_addr_t *ipaddr);
 };
 

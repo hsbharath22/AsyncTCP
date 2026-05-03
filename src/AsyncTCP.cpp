@@ -254,8 +254,14 @@ static inline lwip_tcp_event_packet_t *_get_async_event() {
       grows under control (if possible) and poll events are the safest to discard.
       Let's discard poll events processing using linear-increasing probability curve when queue size grows over 3/4
       Poll events are periodic and connection could get another chance next time
+
+      Exception: if the client has armed an RX or ACK timeout, AsyncClient::_poll()
+      carries the timeout deadline check. Dropping that poll event can silently
+      miss the deadline (especially under MQTT keep-alive load), so we preserve
+      it even when the queue is congested.
     */
-    if (_async_queue.size() > (_xor_shift_next() % CONFIG_ASYNC_TCP_QUEUE_SIZE / 4 + CONFIG_ASYNC_TCP_QUEUE_SIZE * 3 / 4)) {
+    const bool preserve_for_timeout = e->client && (e->client->getRxTimeout() || e->client->getAckTimeout());
+    if (!preserve_for_timeout && _async_queue.size() > (_xor_shift_next() % CONFIG_ASYNC_TCP_QUEUE_SIZE / 4 + CONFIG_ASYNC_TCP_QUEUE_SIZE * 3 / 4)) {
       _free_event(e);
       async_tcp_log_d("discarding poll due to queue congestion");
       continue;
@@ -427,8 +433,16 @@ static int8_t _tcp_connected(void *arg, tcp_pcb *pcb, int8_t err) {
 }
 
 int8_t AsyncTCP_detail::tcp_poll(void *arg, struct tcp_pcb *pcb) {
+  // ets_printf("+P: 0x%08x\n", pcb);
+  AsyncClient *client = reinterpret_cast<AsyncClient *>(arg);
+
+  // Preserve poll events when timeouts are armed: AsyncClient::_poll() carries
+  // the RX/ACK timeout deadline checks, and dropping the event silently can
+  // cause an MQTT keep-alive deadline to be missed entirely.
+  const bool preserve_for_timeout = client && (client->getRxTimeout() || client->getAckTimeout());
+
   // throttle polling events queueing when event queue is getting filled up, let it handle _onack's
-  {
+  if (!preserve_for_timeout) {
     queue_mutex_guard guard;
     // async_tcp_log_d("qs:%u", _async_queue.size());
     if (_async_queue.size() > (_xor_shift_next() % CONFIG_ASYNC_TCP_QUEUE_SIZE / 2 + CONFIG_ASYNC_TCP_QUEUE_SIZE / 4)) {
@@ -437,8 +451,6 @@ int8_t AsyncTCP_detail::tcp_poll(void *arg, struct tcp_pcb *pcb) {
     }
   }
 
-  // ets_printf("+P: 0x%08x\n", pcb);
-  AsyncClient *client = reinterpret_cast<AsyncClient *>(arg);
   lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_POLL, client};
   if (!e) {
     async_tcp_log_e("Failed to allocate event packet");
@@ -494,10 +506,16 @@ int8_t AsyncTCP_detail::tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len) {
 void AsyncTCP_detail::tcp_error(void *arg, int8_t err) {
   // ets_printf("+E: 0x%08x\n", arg);
   AsyncClient *client = reinterpret_cast<AsyncClient *>(arg);
-  if (client && client->_pcb) {
-    // The pcb has already been freed by LwIP; do not attempt to clear the callbacks!
-    _remove_events_for_client(client);
-    client->_pcb = nullptr;
+  if (client) {
+    // Mark ERRORED before nulling _pcb so any thread observing _pcb==null
+    // (e.g. a concurrent canSend() / connected() / close()) also sees a
+    // definite lifecycle state instead of an ambiguous "pcb gone" condition.
+    client->_state = AsyncClient::State::ERRORED;
+    if (client->_pcb) {
+      // The pcb has already been freed by LwIP; do not attempt to clear the callbacks!
+      _remove_events_for_client(client);
+      client->_pcb = nullptr;
+    }
   }
 
   // enqueue event to be processed in the async task for the user callback
@@ -757,7 +775,7 @@ static tcp_pcb *_tcp_listen_with_backlog(tcp_pcb *pcb, uint8_t backlog) {
 AsyncClient::AsyncClient(tcp_pcb *pcb)
   : _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0), _error_cb_arg(0), _recv_cb(0),
     _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _ack_pcb(true), _tx_last_packet(0),
-    _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0) {
+    _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0), _state(pcb ? State::CONNECTED : State::INIT) {
   _pcb = pcb;
   if (_pcb) {
     _rx_last_packet = millis();
@@ -852,6 +870,7 @@ bool AsyncClient::connect(ip_addr_t addr, uint16_t port) {
     _bind_tcp_callbacks(pcb, this);
   }
 
+  _state = State::CONNECTING;
   esp_err_t err = _tcp_connect(pcb, &addr, port, (tcp_connected_fn)&_tcp_connected);
   return err == ESP_OK;
 }
@@ -913,6 +932,7 @@ bool AsyncClient::connect(const char *host, uint16_t port) {
 #endif
   } else if (err == ERR_INPROGRESS) {
     _connect_port = port;
+    _state = State::CONNECTING;
     return true;
   }
   async_tcp_log_d("error: %d", err);
@@ -992,9 +1012,16 @@ int8_t AsyncClient::_close() {
   // ets_printf("X: 0x%08x\n", (uint32_t)this);
   int8_t err = _tcp_close(&_pcb, this);
   // _pcb is now NULL
-  if ((err == ERR_OK) && _discard_cb) {
-    // _pcb was closed here
-    _discard_cb(_discard_cb_arg, this);
+  if (err == ERR_OK) {
+    // Only flip to CLOSED if we weren't already in a terminal error state.
+    // ERRORED is sticky and more informative for the user.
+    if (_state != State::ERRORED) {
+      _state = State::CLOSED;
+    }
+    if (_discard_cb) {
+      // _pcb was closed here
+      _discard_cb(_discard_cb_arg, this);
+    }
   }
   return err;
 }
@@ -1007,6 +1034,7 @@ int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err) {
   _pcb = reinterpret_cast<tcp_pcb *>(pcb);
   if (_pcb) {
     _rx_last_packet = millis();
+    _state = State::CONNECTED;
   }
   _tx_last_packet = 0;
   _rx_last_ack = 0;
@@ -1017,6 +1045,13 @@ int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err) {
 }
 
 void AsyncClient::_error(int8_t err) {
+  // Idempotency guard: tcp_error() already marked us ERRORED in the LwIP
+  // thread. If a second error event somehow lands here (e.g. a queued event
+  // raced with cleanup), don't re-fire user callbacks.
+  if (_state == State::ERRORED && err == ERR_OK) {
+    return;
+  }
+  _state = State::ERRORED;
   if (_error_cb) {
     _error_cb(_error_cb_arg, this, err);
   }
@@ -1025,22 +1060,9 @@ void AsyncClient::_error(int8_t err) {
   }
 }
 
-// In LwIP Thread
-int8_t AsyncClient::_lwip_fin(tcp_pcb *pcb, int8_t err) {
-  if (!_pcb || pcb != _pcb) {
-    async_tcp_log_d("0x%08" PRIx32 " != 0x%08" PRIx32, (uint32_t)pcb, (uint32_t)_pcb);
-    return ERR_OK;
-  }
-  _reset_tcp_callbacks(_pcb, this);
-  if (tcp_close(_pcb) != ERR_OK) {
-    tcp_abort(_pcb);
-  }
-  _pcb = NULL;
-  return ERR_OK;
-}
-
 // In Async Thread
 int8_t AsyncClient::_fin(tcp_pcb *pcb, int8_t err) {
+  _state = State::CLOSING;
   close();
   return ERR_OK;
 }
@@ -1119,6 +1141,7 @@ void AsyncClient::_dns_found(ip_addr_t *ipaddr) {
   if (ipaddr) {
     connect(*ipaddr, _connect_port);
   } else {
+    _state = State::ERRORED;
     if (_error_cb) {
       _error_cb(_error_cb_arg, this, -55);
     }
@@ -1185,6 +1208,9 @@ bool AsyncClient::getNoDelay() {
 }
 
 void AsyncClient::setKeepAlive(uint32_t ms, uint8_t cnt) {
+  if (!_pcb) {
+    return;
+  }
   if (ms != 0) {
     _pcb->so_options |= SOF_KEEPALIVE;  // Turn on TCP Keepalive for the given pcb
     // Set the time between keepalive messages in milli-seconds
@@ -1435,6 +1461,18 @@ const char *AsyncClient::stateToString() const {
     case 9:  return "Last ACK";
     case 10: return "Time Wait";
     default: return "UNKNOWN";
+  }
+}
+
+const char *AsyncClient::stateToString(AsyncClient::State s) {
+  switch (s) {
+    case State::INIT:       return "Init";
+    case State::CONNECTING: return "Connecting";
+    case State::CONNECTED:  return "Connected";
+    case State::CLOSING:    return "Closing";
+    case State::CLOSED:     return "Closed";
+    case State::ERRORED:    return "Errored";
+    default:                return "UNKNOWN";
   }
 }
 
