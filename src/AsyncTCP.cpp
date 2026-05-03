@@ -515,9 +515,12 @@ void AsyncTCP_detail::tcp_error(void *arg, int8_t err) {
   // ets_printf("+E: 0x%08x\n", arg);
   AsyncClient *client = reinterpret_cast<AsyncClient *>(arg);
   if (client) {
-    // Mark ERRORED before nulling _pcb so any thread observing _pcb==null
-    // (e.g. a concurrent canSend() / connected() / close()) also sees a
-    // definite lifecycle state instead of an ambiguous "pcb gone" condition.
+    // Record ERRORED before clearing _pcb to preserve the intended local
+    // store-order in this path. Note: _state is std::atomic with relaxed
+    // ordering and _pcb is a non-atomic raw pointer, so this does not by
+    // itself establish a cross-thread happens-before relationship for
+    // observers of _pcb. Callers that need a coherent view should query
+    // getState() rather than inspect _pcb directly.
     client->_state = AsyncClient::State::ERRORED;
     if (client->_pcb) {
       // The pcb has already been freed by LwIP; do not attempt to clear the callbacks!
@@ -970,6 +973,11 @@ void AsyncClient::close() {
 }
 
 int8_t AsyncClient::abort() {
+  // Mark ERRORED before tearing down the pcb so getState() never reports a
+  // stale CONNECTED/CONNECTING after abort(). lwIP's tcp_abort() does not
+  // synchronously invoke tcp_err in this wrapper's path, so we must update
+  // the lifecycle state here ourselves.
+  _state = State::ERRORED;
   return _tcp_abort(&_pcb, this);
   // _pcb is now NULL
 }
