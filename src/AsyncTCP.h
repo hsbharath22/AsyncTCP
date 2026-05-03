@@ -326,9 +326,14 @@ protected:
   uint32_t _tx_last_packet;
   uint32_t _rx_ack_len;
   uint32_t _rx_last_packet;
-  uint32_t _rx_timeout;
+  // _rx_timeout and _ack_timeout are written from the user thread (via
+  // setRxTimeout / setAckTimeout) and read from the LwIP and async tasks
+  // (in tcp_poll() / _get_async_event() / AsyncClient::_poll()). Atomic
+  // makes the cross-thread reads race-free; default seq_cst ordering is
+  // fine here, these are touched at most once per poll cycle.
+  std::atomic<uint32_t> _rx_timeout;
   uint32_t _rx_last_ack;
-  uint32_t _ack_timeout;
+  std::atomic<uint32_t> _ack_timeout;
   uint16_t _connect_port;
   std::atomic<State> _state;
 

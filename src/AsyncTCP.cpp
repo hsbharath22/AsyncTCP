@@ -255,12 +255,17 @@ static inline lwip_tcp_event_packet_t *_get_async_event() {
       Let's discard poll events processing using linear-increasing probability curve when queue size grows over 3/4
       Poll events are periodic and connection could get another chance next time
 
-      Exception: if the client has armed an RX or ACK timeout, AsyncClient::_poll()
-      carries the timeout deadline check. Dropping that poll event can silently
-      miss the deadline (especially under MQTT keep-alive load), so we preserve
-      it even when the queue is congested.
+      Exception: if the client has armed an RX timeout, AsyncClient::_poll()
+      carries the keep-alive deadline check. Dropping that poll event can
+      silently miss the deadline (especially under MQTT keep-alive load),
+      so we preserve it even when the queue is congested. We deliberately
+      do NOT preserve based on the ACK timeout: it defaults to a non-zero
+      value (CONFIG_ASYNC_TCP_MAX_ACK_TIME) for every client and would
+      effectively disable this throttle for the entire library; ACK
+      deadlines are only meaningful when there is unacked tx in flight,
+      which by definition keeps the async queue draining.
     */
-    const bool preserve_for_timeout = e->client && (e->client->getRxTimeout() || e->client->getAckTimeout());
+    const bool preserve_for_timeout = e->client && (e->client->getRxTimeout() != 0);
     if (!preserve_for_timeout && _async_queue.size() > (_xor_shift_next() % CONFIG_ASYNC_TCP_QUEUE_SIZE / 4 + CONFIG_ASYNC_TCP_QUEUE_SIZE * 3 / 4)) {
       _free_event(e);
       async_tcp_log_d("discarding poll due to queue congestion");
@@ -436,10 +441,13 @@ int8_t AsyncTCP_detail::tcp_poll(void *arg, struct tcp_pcb *pcb) {
   // ets_printf("+P: 0x%08x\n", pcb);
   AsyncClient *client = reinterpret_cast<AsyncClient *>(arg);
 
-  // Preserve poll events when timeouts are armed: AsyncClient::_poll() carries
-  // the RX/ACK timeout deadline checks, and dropping the event silently can
-  // cause an MQTT keep-alive deadline to be missed entirely.
-  const bool preserve_for_timeout = client && (client->getRxTimeout() || client->getAckTimeout());
+  // Preserve poll events when an RX timeout is armed: AsyncClient::_poll()
+  // carries the keep-alive deadline check, and dropping the event silently
+  // can cause an MQTT keep-alive deadline to be missed entirely. See the
+  // matching note in _get_async_event() for why we don't preserve based on
+  // ACK timeout (it's non-zero by default and would disable throttling
+  // globally).
+  const bool preserve_for_timeout = client && (client->getRxTimeout() != 0);
 
   // throttle polling events queueing when event queue is getting filled up, let it handle _onack's
   if (!preserve_for_timeout) {
@@ -872,8 +880,18 @@ bool AsyncClient::connect(ip_addr_t addr, uint16_t port) {
 
   esp_err_t err = _tcp_connect(pcb, &addr, port, (tcp_connected_fn)&_tcp_connected);
   if (err != ESP_OK) {
-    // Connect failed synchronously: leave state at INIT so callers don't
-    // observe a stuck "connecting" client.
+    // Connect failed synchronously. The pcb is still alive in lwIP and has
+    // callbacks bound back to this AsyncClient via tcp_arg(). Reset the
+    // callbacks and close/abort the pcb so it doesn't leak (and so a stale
+    // tcp_arg can't deliver an event to this AsyncClient later). Leave
+    // _state at INIT so callers don't observe a stuck "connecting" client.
+    {
+      tcp_core_guard tcg;
+      _reset_tcp_callbacks(pcb, this);
+      if (tcp_close(pcb) != ERR_OK) {
+        tcp_abort(pcb);
+      }
+    }
     return false;
   }
   _state = State::CONNECTING;
@@ -1050,9 +1068,17 @@ int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err) {
 }
 
 void AsyncClient::_error(int8_t err) {
-  // tcp_error() already set _state = ERRORED in the LwIP thread for
-  // cross-thread visibility; this store is redundant but harmless and keeps
-  // the AsyncClient-thread side self-contained.
+  // No idempotency guard is needed here: tcp_error() in the LwIP thread
+  // calls _remove_events_for_client() *before* enqueuing the new
+  // LWIP_TCP_ERROR event, so the queue can never hold more than one error
+  // event per error episode. lwIP itself only fires tcp_err once per pcb
+  // (the pcb is freed afterwards). If the user reconnects on the same
+  // AsyncClient and the new connection later errors out, we *want* _error
+  // to fire again — that is a separate error episode.
+  //
+  // The _state store below is a redundant repeat of the one in tcp_error()
+  // (kept for the case where _error is reached via a path other than
+  // tcp_error, and so the AsyncClient-thread side is self-contained).
   _state = State::ERRORED;
   if (_error_cb) {
     _error_cb(_error_cb_arg, this, err);
