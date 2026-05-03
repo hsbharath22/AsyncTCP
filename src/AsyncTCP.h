@@ -16,6 +16,7 @@
 
 #include "lwip/ip6_addr.h"
 #include "lwip/ip_addr.h"
+#include <atomic>
 #include <functional>
 
 #ifndef LIBRETINY
@@ -79,15 +80,15 @@ public:
    * @brief Lifecycle state of the AsyncClient.
    *
    * Independent of lwIP's per-pcb TCP state — this tracks how the AsyncClient
-   * itself sees its lifecycle, and remains valid after `_pcb` has been freed
-   * by lwIP (e.g. after a TCP error). Use getState() / stateToString() to
-   * query it from any thread.
+   * itself sees its lifecycle and remains valid after `_pcb` has been freed
+   * by lwIP (e.g. after a TCP error). Stored as std::atomic so getState() is
+   * safe to call concurrently with the LwIP and async tasks.
    */
   enum class State : uint8_t {
     INIT,        // newly constructed, not yet connecting
     CONNECTING,  // connect() issued, awaiting connect callback or DNS
     CONNECTED,   // ESTABLISHED
-    CLOSING,     // close() called or FIN received, teardown in progress
+    CLOSING,     // FIN received from peer, deferred teardown in progress
     CLOSED,      // graceful close completed
     ERRORED,     // tcp_error fired; pcb has been freed by lwIP
   };
@@ -278,13 +279,19 @@ public:
   }
 
   static const char *errorToString(int8_t error);
+  // Human-readable name of the current lwIP pcb state (Established, Close Wait, ...).
+  // Returns "Closed" once the pcb has been freed; use stateToString(getState())
+  // for the AsyncClient-level lifecycle view.
   const char *stateToString() const;
 
   // AsyncClient-level lifecycle state (independent of lwIP pcb state).
-  // Safe to call after a TCP error has freed the underlying pcb.
+  // Safe to call after a TCP error has freed the underlying pcb, and safe to
+  // call concurrently from any thread (backed by std::atomic).
   State getState() const {
-    return _state;
+    return _state.load(std::memory_order_relaxed);
   }
+  // Human-readable name of an AsyncClient::State value.
+  // Use as: AsyncClient::stateToString(client.getState()).
   static const char *stateToString(State s);
 
   int8_t _recv(tcp_pcb *pcb, pbuf *pb, int8_t err);
@@ -323,7 +330,7 @@ protected:
   uint32_t _rx_last_ack;
   uint32_t _ack_timeout;
   uint16_t _connect_port;
-  State _state;
+  std::atomic<State> _state;
 
   int8_t _close();
   int8_t _connected(tcp_pcb *pcb, int8_t err);

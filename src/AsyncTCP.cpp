@@ -870,9 +870,14 @@ bool AsyncClient::connect(ip_addr_t addr, uint16_t port) {
     _bind_tcp_callbacks(pcb, this);
   }
 
-  _state = State::CONNECTING;
   esp_err_t err = _tcp_connect(pcb, &addr, port, (tcp_connected_fn)&_tcp_connected);
-  return err == ESP_OK;
+  if (err != ESP_OK) {
+    // Connect failed synchronously: leave state at INIT so callers don't
+    // observe a stuck "connecting" client.
+    return false;
+  }
+  _state = State::CONNECTING;
+  return true;
 }
 
 #ifdef ARDUINO
@@ -1045,12 +1050,9 @@ int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err) {
 }
 
 void AsyncClient::_error(int8_t err) {
-  // Idempotency guard: tcp_error() already marked us ERRORED in the LwIP
-  // thread. If a second error event somehow lands here (e.g. a queued event
-  // raced with cleanup), don't re-fire user callbacks.
-  if (_state == State::ERRORED && err == ERR_OK) {
-    return;
-  }
+  // tcp_error() already set _state = ERRORED in the LwIP thread for
+  // cross-thread visibility; this store is redundant but harmless and keeps
+  // the AsyncClient-thread side self-contained.
   _state = State::ERRORED;
   if (_error_cb) {
     _error_cb(_error_cb_arg, this, err);
