@@ -16,6 +16,7 @@
 
 #include "lwip/ip6_addr.h"
 #include "lwip/ip_addr.h"
+#include <atomic>
 #include <functional>
 
 #ifndef LIBRETINY
@@ -75,6 +76,23 @@ class AsyncTCP_detail;
 
 class AsyncClient {
 public:
+  /**
+   * @brief Lifecycle state of the AsyncClient.
+   *
+   * Independent of lwIP's per-pcb TCP state — this tracks how the AsyncClient
+   * itself sees its lifecycle and remains valid after `_pcb` has been freed
+   * by lwIP (e.g. after a TCP error). Stored as std::atomic so getState() is
+   * safe to call concurrently with the LwIP and async tasks.
+   */
+  enum class State : uint8_t {
+    INIT,        // newly constructed, not yet connecting
+    CONNECTING,  // connect() issued, awaiting connect callback or DNS
+    CONNECTED,   // ESTABLISHED
+    CLOSING,     // FIN received from peer, deferred teardown in progress
+    CLOSED,      // graceful close completed
+    ERRORED,     // tcp_error fired; pcb has been freed by lwIP
+  };
+
   AsyncClient(tcp_pcb *pcb = 0);
   ~AsyncClient();
 
@@ -261,7 +279,20 @@ public:
   }
 
   static const char *errorToString(int8_t error);
+  // Human-readable name of the current lwIP pcb state (Established, Close Wait, ...).
+  // Returns "Closed" once the pcb has been freed; use stateToString(getState())
+  // for the AsyncClient-level lifecycle view.
   const char *stateToString() const;
+
+  // AsyncClient-level lifecycle state (independent of lwIP pcb state).
+  // Safe to call after a TCP error has freed the underlying pcb, and safe to
+  // call concurrently from any thread (backed by std::atomic).
+  State getState() const {
+    return _state.load(std::memory_order_relaxed);
+  }
+  // Human-readable name of an AsyncClient::State value.
+  // Use as: AsyncClient::stateToString(client.getState()).
+  static const char *stateToString(State s);
 
   int8_t _recv(tcp_pcb *pcb, pbuf *pb, int8_t err);
   tcp_pcb *pcb() {
@@ -295,10 +326,16 @@ protected:
   uint32_t _tx_last_packet;
   uint32_t _rx_ack_len;
   uint32_t _rx_last_packet;
-  uint32_t _rx_timeout;
+  // _rx_timeout and _ack_timeout are written from the user thread (via
+  // setRxTimeout / setAckTimeout) and read from the LwIP and async tasks
+  // (in tcp_poll() / _get_async_event() / AsyncClient::_poll()). Atomic
+  // makes the cross-thread reads race-free; default seq_cst ordering is
+  // fine here, these are touched at most once per poll cycle.
+  std::atomic<uint32_t> _rx_timeout;
   uint32_t _rx_last_ack;
-  uint32_t _ack_timeout;
+  std::atomic<uint32_t> _ack_timeout;
   uint16_t _connect_port;
+  std::atomic<State> _state;
 
   int8_t _close();
   int8_t _connected(tcp_pcb *pcb, int8_t err);
@@ -306,7 +343,6 @@ protected:
   int8_t _poll(tcp_pcb *pcb);
   int8_t _sent(tcp_pcb *pcb, uint16_t len);
   int8_t _fin(tcp_pcb *pcb, int8_t err);
-  int8_t _lwip_fin(tcp_pcb *pcb, int8_t err);
   void _dns_found(ip_addr_t *ipaddr);
 };
 
